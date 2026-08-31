@@ -68,24 +68,35 @@ async function fillLogin(page) {
   await login.fill(process.env.SCHOOL_LOGIN_ID);
   await password.fill(process.env.SCHOOL_PASSWORD);
 
-  const submitCandidates = [
-    page.getByRole("button", { name: /login|sign in|log in/i }).first(),
-    page.locator('input[type="submit"]').first(),
-    page.locator('button[type="submit"]').first()
-  ];
+    const signInButton = page.getByRole("button", { name: /sign in/i }).first();
 
-  for (const submit of submitCandidates) {
-    if (await submit.count()) {
-      await Promise.allSettled([
-        page.waitForLoadState("networkidle", { timeout: 15000 }),
-        submit.click()
-      ]);
-      return;
-    }
+  if (!(await signInButton.count())) {
+    throw new Error("Sign In button was not found.");
   }
 
-  await password.press("Enter");
-  await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+  console.log("Clicking Sign In...");
+  await signInButton.click();
+
+  // Give the school portal time to complete authentication.
+  await page.waitForTimeout(3000);
+  await page.waitForLoadState("domcontentloaded").catch(() => {});
+
+  console.log("URL after login:", page.url());
+
+  // Verify that the login form has actually disappeared.
+  const passwordStillVisible = await page
+    .locator('input[type="password"]')
+    .first()
+    .isVisible()
+    .catch(() => false);
+
+  if (passwordStillVisible) {
+    throw new Error(
+      "Login failed: the school login page is still visible after clicking Sign In."
+    );
+  }
+
+  console.log("Login successful.");
 }
 
 async function discoverPdfLinks(page) {
