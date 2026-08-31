@@ -1,0 +1,15 @@
+{
+  "name": "school-homework-agent",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "docx": "^9.5.1",
+    "openai": "^5.0.0",
+    "pdf-parse": "^1.1.1",
+    "playwright": "^1.55.0"
+  }
+}
