@@ -208,11 +208,40 @@ async function main() {
     console.log("Attempting login...");
     await fillLogin(page);
 
-    console.log("Opening homework page...");
-    await page.goto(process.env.SCHOOL_HOMEWORK_URL, {
-      waitUntil: "domcontentloaded",
-      timeout: 30000
-    });
+    console.log("Opening HomeWork Submission from portal menu...");
+
+// Open the side menu if HomeWork Submission is not already visible.
+let homeworkMenu = page.getByText("HomeWork Submission", { exact: true }).first();
+
+if (!(await homeworkMenu.isVisible().catch(() => false))) {
+  const menuButton = page.locator(
+    'button:has-text("☰"), .navbar-toggler, .menu-toggle, [class*="menu"], [class*="hamburger"]'
+  ).first();
+
+  if (await menuButton.count()) {
+    await menuButton.click().catch(() => {});
+    await page.waitForTimeout(1000);
+  }
+}
+
+homeworkMenu = page.getByText("HomeWork Submission", { exact: true }).first();
+
+if (!(await homeworkMenu.count())) {
+  throw new Error("HomeWork Submission menu item was not found.");
+}
+
+console.log("Clicking HomeWork Submission...");
+await homeworkMenu.click();
+
+await page.waitForTimeout(3000);
+await page.waitForLoadState("domcontentloaded").catch(() => {});
+
+console.log("Homework page URL:", page.url());
+console.log("Homework heading visible:",
+  await page.getByText("Homeworks", { exact: true }).first()
+    .isVisible()
+    .catch(() => false)
+);
     await page.waitForTimeout(2500);
 
     const links = await discoverPdfLinks(page);
