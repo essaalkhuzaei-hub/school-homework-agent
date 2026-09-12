@@ -1,4 +1,3 @@
-
 import fs from "fs";
 import path from "path";
 import { chromium } from "playwright";
@@ -12,9 +11,12 @@ import {
   TextRun
 } from "docx";
 
+/* =========================================================
+   CONFIGURATION
+   ========================================================= */
+
 const required = [
   "SCHOOL_LOGIN_URL",
-  "SCHOOL_HOMEWORK_URL",
   "SCHOOL_LOGIN_ID",
   "SCHOOL_PASSWORD",
   "OPENAI_API_KEY"
@@ -26,26 +28,55 @@ for (const key of required) {
   }
 }
 
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
+
+const MODEL = process.env.OPENAI_MODEL || "gpt-5.6-luna";
+
 const DOWNLOAD_DIR = path.resolve("downloads");
 const OUTPUT_DIR = path.resolve("output");
+
 fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
 fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const model = process.env.OPENAI_MODEL || "gpt-5.6-luna";
+const STUDENTS = ["MUNEERA", "MARYAM"];
+
+/* =========================================================
+   HELPERS
+   ========================================================= */
 
 function safeName(value) {
-  return (value || "homework")
-    .replace(/[<>:"/\\|?*\x00-\x1F]/g, "_")
+  return String(value || "homework")
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, "-")
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 120);
 }
 
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function isVisible(locator) {
+  try {
+    return await locator.first().isVisible();
+  } catch {
+    return false;
+  }
+}
+
+/* =========================================================
+   LOGIN
+   ========================================================= */
+
 async function fillLogin(page) {
+  console.log("Attempting login...");
+
   const password = page.locator('input[type="password"]').first();
+
   if (!(await password.count())) {
-    throw new Error("Password field was not found. Login page selectors need adjustment.");
+    throw new Error("Password field was not found.");
   }
 
   const loginCandidates = [
@@ -57,18 +88,24 @@ async function fillLogin(page) {
   ];
 
   let login = null;
+
   for (const candidate of loginCandidates) {
     if (await candidate.count()) {
       login = candidate;
       break;
     }
   }
-  if (!login) throw new Error("Login ID field was not found.");
+
+  if (!login) {
+    throw new Error("Login ID field was not found.");
+  }
 
   await login.fill(process.env.SCHOOL_LOGIN_ID);
   await password.fill(process.env.SCHOOL_PASSWORD);
 
-    const signInButton = page.getByRole("button", { name: /sign in/i }).first();
+  const signInButton = page
+    .getByRole("button", { name: /sign in/i })
+    .first();
 
   if (!(await signInButton.count())) {
     throw new Error("Sign In button was not found.");
@@ -77,13 +114,13 @@ async function fillLogin(page) {
   console.log("Clicking Sign In...");
   await signInButton.click();
 
-  // Give the school portal time to complete authentication.
-  await page.waitForTimeout(3000);
-  await page.waitForLoadState("domcontentloaded").catch(() => {});
+  await page.waitForTimeout(4000);
+  await page
+    .waitForLoadState("domcontentloaded", { timeout: 15000 })
+    .catch(() => {});
 
   console.log("URL after login:", page.url());
 
-  // Verify that the login form has actually disappeared.
   const passwordStillVisible = await page
     .locator('input[type="password"]')
     .first()
@@ -92,199 +129,646 @@ async function fillLogin(page) {
 
   if (passwordStillVisible) {
     throw new Error(
-      "Login failed: the school login page is still visible after clicking Sign In."
+      "Login failed: login page is still visible after clicking Sign In."
     );
   }
 
   console.log("Login successful.");
 }
 
-async function discoverPdfLinks(page) {
-  return await page.locator("a").evaluateAll((anchors) =>
-    anchors
-      .map((a) => ({
-        href: a.href || "",
-        text: (a.innerText || a.textContent || "").trim()
-      }))
-      .filter((x) =>
-        /\.pdf(?:$|\?)/i.test(x.href) ||
-        /pdf|homework|worksheet|assignment/i.test(x.text)
-      )
-  );
+/* =========================================================
+   OPEN HOMEWORK PAGE
+   ========================================================= */
+
+async function openHomeworkPage(page) {
+  console.log("Opening HomeWork Submission from portal menu...");
+
+  const menuCandidates = [
+    page.getByText("HomeWork Submission", { exact: true }).first(),
+    page.getByText(/HomeWork Submission/i).first(),
+    page.getByText(/Homework Submission/i).first()
+  ];
+
+  let homeworkMenu = null;
+
+  for (const candidate of menuCandidates) {
+    if (await candidate.count()) {
+      homeworkMenu = candidate;
+      break;
+    }
+  }
+
+  if (!homeworkMenu) {
+    throw new Error("HomeWork Submission menu item was not found.");
+  }
+
+  await homeworkMenu.click();
+
+  await page.waitForTimeout(3000);
+  await page
+    .waitForLoadState("domcontentloaded")
+    .catch(() => {});
+
+  console.log("Homework page URL:", page.url());
+
+  const headingVisible = await page
+    .getByText("Homeworks", { exact: true })
+    .first()
+    .isVisible()
+    .catch(() => false);
+
+  console.log("Homework heading visible:", headingVisible);
+
+  if (!headingVisible) {
+    console.log(
+      "Warning: Homeworks heading was not detected, continuing anyway."
+    );
+  }
 }
 
-async function downloadPdf(context, item, index) {
-  const response = await context.request.get(item.href);
-  if (!response.ok()) {
-    throw new Error(`Download failed (${response.status()}): ${item.href}`);
+/* =========================================================
+   SELECT STUDENT
+   ========================================================= */
+
+async function selectStudent(page, studentName) {
+  console.log(`Selecting student: ${studentName}`);
+
+  /*
+    The portal shows the currently selected student in the
+    upper-left area. Clicking the student/avatar opens My Ward(s).
+  */
+
+  const currentWardCandidates = [
+    page.locator("aside").getByText(/MARYAM|MUNEERA/i).first(),
+    page.getByText(/MARYAM|MUNEERA/i).first()
+  ];
+
+  let currentWard = null;
+
+  for (const candidate of currentWardCandidates) {
+    if (await candidate.count() && await isVisible(candidate)) {
+      currentWard = candidate;
+      break;
+    }
   }
-  const body = await response.body();
-  const contentType = response.headers()["content-type"] || "";
-  if (!contentType.toLowerCase().includes("pdf") && !item.href.toLowerCase().includes(".pdf")) {
-    console.warn(`Skipping non-PDF candidate: ${item.text || item.href}`);
+
+  if (!currentWard) {
+    throw new Error(
+      `Could not find the current student selector before selecting ${studentName}.`
+    );
+  }
+
+  await currentWard.click();
+  await page.waitForTimeout(1200);
+
+  const target = page
+    .getByText(new RegExp(`^${studentName}$`, "i"), { exact: true })
+    .last();
+
+  if (!(await target.count())) {
+    throw new Error(
+      `Student ${studentName} was not found in My Ward(s).`
+    );
+  }
+
+  await target.click();
+
+  await page.waitForTimeout(3000);
+  await page
+    .waitForLoadState("domcontentloaded")
+    .catch(() => {});
+
+  console.log(`${studentName} selected.`);
+
+  /*
+    Some versions of the portal return to the dashboard after
+    changing student, so reopen HomeWork Submission if necessary.
+  */
+
+  const homeworkHeading = page
+    .getByText("Homeworks", { exact: true })
+    .first();
+
+  if (!(await isVisible(homeworkHeading))) {
+    await openHomeworkPage(page);
+  }
+
+  await page.waitForTimeout(2000);
+}
+
+/* =========================================================
+   FIND HOMEWORK ROWS
+   ========================================================= */
+
+async function getHomeworkRows(page) {
+  const rows = page.locator("table tbody tr");
+  const count = await rows.count();
+
+  const results = [];
+
+  for (let i = 0; i < count; i++) {
+    const row = rows.nth(i);
+
+    const text = (await row.innerText().catch(() => "")).trim();
+
+    if (!text) continue;
+
+    const cells = row.locator("td");
+    const cellCount = await cells.count();
+
+    if (cellCount < 2) continue;
+
+    let subject = "";
+
+    /*
+      In the school table the subject is normally the second
+      meaningful column.
+    */
+
+    for (let c = 0; c < cellCount; c++) {
+      const value = (await cells.nth(c).innerText().catch(() => "")).trim();
+
+      if (
+        value &&
+        !/^\d+$/.test(value) &&
+        !/^HW\d*$/i.test(value) &&
+        !/submit homework/i.test(value) &&
+        !/^\d{1,2}[-/]\d{1,2}[-/]\d{4}$/.test(value)
+      ) {
+        subject = value;
+        break;
+      }
+    }
+
+    if (!subject) {
+      subject = `Subject-${i + 1}`;
+    }
+
+    results.push({
+      row,
+      subject: safeName(subject),
+      rowText: text,
+      index: i
+    });
+  }
+
+  console.log(`Found ${results.length} homework row(s).`);
+  return results;
+}
+
+/* =========================================================
+   DOWNLOAD ATTACHMENT FROM A HOMEWORK ROW
+   ========================================================= */
+
+async function downloadHomework(page, homework, studentName) {
+  const { row, subject, index } = homework;
+
+  console.log(
+    `Looking for attachment: ${studentName} / ${subject}`
+  );
+
+  const studentDir = path.join(
+    DOWNLOAD_DIR,
+    safeName(studentName),
+    safeName(subject)
+  );
+
+  fs.mkdirSync(studentDir, { recursive: true });
+
+  /*
+    The attachment in this portal is represented by the green
+    download icon inside the homework row.
+  */
+
+  const clickableCandidates = [
+    row.locator('a[download]').first(),
+    row.locator('a[href*=".pdf" i]').first(),
+    row.locator('a').filter({ has: row.locator("svg") }).first(),
+    row.locator('a').filter({ has: row.locator("i") }).first(),
+    row.locator('button').filter({ has: row.locator("svg") }).first(),
+    row.locator('button').filter({ has: row.locator("i") }).first()
+  ];
+
+  let downloadControl = null;
+
+  for (const candidate of clickableCandidates) {
+    if (await candidate.count() && await isVisible(candidate)) {
+      downloadControl = candidate;
+      break;
+    }
+  }
+
+  /*
+    Fallback: inspect all links/buttons in the row and ignore
+    "Submit Homework".
+  */
+
+  if (!downloadControl) {
+    const controls = row.locator("a, button");
+    const controlCount = await controls.count();
+
+    for (let i = 0; i < controlCount; i++) {
+      const control = controls.nth(i);
+
+      const text = (
+        await control.innerText().catch(() => "")
+      ).trim();
+
+      if (/submit homework/i.test(text)) continue;
+
+      if (await isVisible(control)) {
+        downloadControl = control;
+        break;
+      }
+    }
+  }
+
+  if (!downloadControl) {
+    console.log(
+      `No downloadable attachment found for ${studentName} / ${subject}.`
+    );
     return null;
   }
-  const filename = `${String(index + 1).padStart(2, "0")}-${safeName(item.text || "homework")}.pdf`;
-  const filepath = path.join(DOWNLOAD_DIR, filename);
-  fs.writeFileSync(filepath, body);
-  return filepath;
+
+  try {
+    const downloadPromise = page.waitForEvent("download", {
+      timeout: 15000
+    });
+
+    await downloadControl.click();
+
+    const download = await downloadPromise;
+
+    let suggested = download.suggestedFilename();
+
+    if (!suggested.toLowerCase().endsWith(".pdf")) {
+      suggested = `${subject}-${index + 1}.pdf`;
+    }
+
+    const filePath = path.join(
+      studentDir,
+      safeName(suggested)
+    );
+
+    await download.saveAs(filePath);
+
+    console.log(`Downloaded: ${filePath}`);
+
+    return {
+      student: studentName,
+      subject,
+      filePath
+    };
+  } catch (error) {
+    console.log(
+      `Direct download event not detected for ${subject}: ${error.message}`
+    );
+
+    /*
+      Some school portals open the PDF in another tab instead
+      of emitting a normal download event.
+    */
+
+    const href = await downloadControl
+      .getAttribute("href")
+      .catch(() => null);
+
+    if (href && href !== "#" && !href.startsWith("javascript:")) {
+      try {
+        const absoluteUrl = new URL(href, page.url()).href;
+
+        const response = await page.context().request.get(absoluteUrl);
+
+        if (response.ok()) {
+          const body = await response.body();
+
+          const filePath = path.join(
+            studentDir,
+            `${safeName(subject)}-${index + 1}.pdf`
+          );
+
+          fs.writeFileSync(filePath, body);
+
+          console.log(`Downloaded by authenticated request: ${filePath}`);
+
+          return {
+            student: studentName,
+            subject,
+            filePath
+          };
+        }
+      } catch (fallbackError) {
+        console.log(
+          `Fallback download failed: ${fallbackError.message}`
+        );
+      }
+    }
+
+    return null;
+  }
 }
 
-async function extractPdfText(filepath) {
-  const data = await pdf(fs.readFileSync(filepath));
-  return (data.text || "").trim();
+/* =========================================================
+   READ PDF
+   ========================================================= */
+
+async function readPdf(filePath) {
+  const buffer = fs.readFileSync(filePath);
+
+  const parsed = await pdf(buffer);
+
+  return (parsed.text || "").trim();
 }
 
-async function solveHomework(label, text) {
-  if (!text) {
-    return "تعذر استخراج نص واضح من ملف PDF. يحتاج الملف إلى مراجعة يدوية أو معالجة صور.";
+/* =========================================================
+   SOLVE HOMEWORK
+   ========================================================= */
+
+async function solveHomework(student, subject, homeworkText) {
+  console.log(`Solving ${student} / ${subject}...`);
+
+  if (!homeworkText) {
+    return (
+      "The PDF did not contain extractable text. " +
+      "The homework may be image-based and requires visual processing."
+    );
   }
 
+  const prompt = `
+You are helping a school student complete homework.
+
+Student: ${student}
+Subject: ${subject}
+
+Read the homework carefully.
+
+Instructions:
+- Answer every question.
+- Keep the answers appropriate for the student's school level.
+- Preserve question numbering.
+- Give clear, concise answers.
+- If the homework is Arabic, answer in Arabic.
+- If the homework is English, answer in English.
+- For mathematics, show the necessary working.
+- Do not invent questions that are not in the homework.
+- Return only the organized homework answers.
+
+HOMEWORK:
+
+${homeworkText}
+`;
+
   const response = await openai.responses.create({
-    model,
-    input: [
-      {
-        role: "system",
-        content:
-          "You are a careful school homework assistant. Solve only from the supplied homework. Preserve question numbering and sections. Give clear student-ready answers. If a question is unclear or depends on an unreadable image, explicitly say it needs review rather than inventing an answer. Match the language of each question."
-      },
-      {
-        role: "user",
-        content: `Homework file: ${label}\n\n${text}`
-      }
-    ]
+    model: MODEL,
+    input: prompt
   });
 
-  return response.output_text || "No answer was produced.";
+  return response.output_text || "No answer generated.";
 }
 
-async function makeDocx(results) {
+/* =========================================================
+   CREATE WORD DOCUMENT
+   ========================================================= */
+
+async function createSubjectDocument(
+  student,
+  subject,
+  solvedHomeworks
+) {
   const children = [
     new Paragraph({
-      text: "Weekly Homework Answers",
+      text: `${student} - ${subject}`,
       heading: HeadingLevel.TITLE
     }),
     new Paragraph({
       children: [
         new TextRun({
-          text: `Generated: ${new Date().toLocaleString("en-GB", { timeZone: "Asia/Qatar" })}`,
-          italics: true
+          text: `Student: ${student}`,
+          bold: true
         })
       ]
-    })
+    }),
+    new Paragraph({
+      children: [
+        new TextRun({
+          text: `Subject: ${subject}`,
+          bold: true
+        })
+      ]
+    }),
+    new Paragraph("")
   ];
 
-  for (const result of results) {
+  solvedHomeworks.forEach((item, index) => {
     children.push(
-      new Paragraph({ text: result.label, heading: HeadingLevel.HEADING_1 })
+      new Paragraph({
+        text: `Homework ${index + 1}`,
+        heading: HeadingLevel.HEADING_1
+      })
     );
-    for (const line of result.answer.split(/\r?\n/)) {
-      children.push(new Paragraph({ text: line || " " }));
+
+    const lines = String(item.answer || "")
+      .split(/\r?\n/)
+      .filter(line => line.trim());
+
+    for (const line of lines) {
+      children.push(
+        new Paragraph({
+          text: line
+        })
+      );
+    }
+
+    children.push(new Paragraph(""));
+  });
+
+  const doc = new Document({
+    sections: [
+      {
+        properties: {},
+        children
+      }
+    ]
+  });
+
+  const studentOutputDir = path.join(
+    OUTPUT_DIR,
+    safeName(student)
+  );
+
+  fs.mkdirSync(studentOutputDir, { recursive: true });
+
+  const outputPath = path.join(
+    studentOutputDir,
+    `${safeName(student)}-${safeName(subject)}.docx`
+  );
+
+  const buffer = await Packer.toBuffer(doc);
+
+  fs.writeFileSync(outputPath, buffer);
+
+  console.log(`Word document created: ${outputPath}`);
+
+  return outputPath;
+}
+
+/* =========================================================
+   PROCESS ONE STUDENT
+   ========================================================= */
+
+async function processStudent(page, studentName) {
+  console.log("");
+  console.log("======================================");
+  console.log(`PROCESSING STUDENT: ${studentName}`);
+  console.log("======================================");
+
+  await selectStudent(page, studentName);
+
+  await page.waitForTimeout(2500);
+
+  const homeworkRows = await getHomeworkRows(page);
+
+  if (!homeworkRows.length) {
+    console.log(`No homework rows found for ${studentName}.`);
+    return [];
+  }
+
+  const grouped = {};
+
+  for (const homework of homeworkRows) {
+    const downloaded = await downloadHomework(
+      page,
+      homework,
+      studentName
+    );
+
+    if (!downloaded) {
+      continue;
+    }
+
+    try {
+      const text = await readPdf(downloaded.filePath);
+
+      const answer = await solveHomework(
+        studentName,
+        downloaded.subject,
+        text
+      );
+
+      if (!grouped[downloaded.subject]) {
+        grouped[downloaded.subject] = [];
+      }
+
+      grouped[downloaded.subject].push({
+        pdf: downloaded.filePath,
+        answer
+      });
+    } catch (error) {
+      console.log(
+        `Failed processing ${downloaded.filePath}: ${error.message}`
+      );
     }
   }
 
-  const doc = new Document({ sections: [{ children }] });
-  const buffer = await Packer.toBuffer(doc);
-  const stamp = new Date().toISOString().slice(0, 10);
-  const out = path.join(OUTPUT_DIR, `homework-answers-${stamp}.docx`);
-  fs.writeFileSync(out, buffer);
-  return out;
+  const documents = [];
+
+  for (const [subject, items] of Object.entries(grouped)) {
+    const docPath = await createSubjectDocument(
+      studentName,
+      subject,
+      items
+    );
+
+    documents.push(docPath);
+  }
+
+  console.log(
+    `${studentName}: created ${documents.length} subject document(s).`
+  );
+
+  return documents;
 }
+
+/* =========================================================
+   MAIN
+   ========================================================= */
 
 async function main() {
   console.log("Starting School Homework Agent...");
-  const browser = await chromium.launch({ headless: true });
+
+  const browser = await chromium.launch({
+    headless: true
+  });
+
+  const context = await browser.newContext({
+    acceptDownloads: true
+  });
+
+  const page = await context.newPage();
 
   try {
-    const context = await browser.newContext({ acceptDownloads: true });
-    const page = await context.newPage();
-
     console.log("Opening school login page...");
+
     await page.goto(process.env.SCHOOL_LOGIN_URL, {
       waitUntil: "domcontentloaded",
       timeout: 30000
     });
 
-    console.log("Attempting login...");
     await fillLogin(page);
 
-    console.log("Opening HomeWork Submission from portal menu...");
-
-// Open the side menu if HomeWork Submission is not already visible.
-let homeworkMenu = page.getByText("HomeWork Submission", { exact: true }).first();
-
-if (!(await homeworkMenu.isVisible().catch(() => false))) {
-  const menuButton = page.locator(
-    'button:has-text("☰"), .navbar-toggler, .menu-toggle, [class*="menu"], [class*="hamburger"]'
-  ).first();
-
-  if (await menuButton.count()) {
-    await menuButton.click().catch(() => {});
-    await page.waitForTimeout(1000);
-  }
-}
-
-homeworkMenu = page.getByText("HomeWork Submission", { exact: true }).first();
-
-if (!(await homeworkMenu.count())) {
-  throw new Error("HomeWork Submission menu item was not found.");
-}
-
-console.log("Clicking HomeWork Submission...");
-await homeworkMenu.click();
-
-await page.waitForTimeout(3000);
-await page.waitForLoadState("domcontentloaded").catch(() => {});
-
-console.log("Homework page URL:", page.url());
-console.log("Homework heading visible:",
-  await page.getByText("Homeworks", { exact: true }).first()
-    .isVisible()
-    .catch(() => false)
-);
     await page.waitForTimeout(2500);
 
-    const links = await discoverPdfLinks(page);
-    console.log(`Found ${links.length} PDF/link candidate(s).`);
+    /*
+      First open HomeWork Submission.
+      Student processing will reopen it automatically when needed.
+    */
 
-    if (!links.length) {
-      console.log("Page title:", await page.title());
-      console.log("Current URL:", page.url());
-      throw new Error(
-        "No homework PDF links were detected. The first Render log will help us adjust the portal-specific selectors."
-      );
-    }
+    await openHomeworkPage(page);
 
-    const results = [];
-    for (let i = 0; i < links.length; i++) {
-      const item = links[i];
-      console.log(`Processing ${i + 1}/${links.length}: ${item.text || item.href}`);
+    const allDocuments = [];
+
+    /*
+      Required order:
+      1. Muneera
+      2. Maryam
+    */
+
+    for (const student of STUDENTS) {
       try {
-        const filepath = await downloadPdf(context, item, i);
-        if (!filepath) continue;
-        const text = await extractPdfText(filepath);
-        const answer = await solveHomework(path.basename(filepath), text);
-        results.push({
-          label: item.text || path.basename(filepath),
-          answer
-        });
-      } catch (err) {
-        console.error(`Failed item ${i + 1}:`, err.message);
+        const docs = await processStudent(page, student);
+        allDocuments.push(...docs);
+      } catch (error) {
+        console.error(
+          `Failed while processing ${student}:`,
+          error.message
+        );
       }
     }
 
-    if (!results.length) {
-      throw new Error("No homework PDFs were successfully processed.");
-    }
+    console.log("");
+    console.log("======================================");
+    console.log("HOMEWORK AGENT FINISHED");
+    console.log("======================================");
 
-    const output = await makeDocx(results);
-    console.log(`SUCCESS: Word document created at ${output}`);
+    if (!allDocuments.length) {
+      console.log(
+        "No homework documents were created. There may be no available homework attachments."
+      );
+    } else {
+      console.log(
+        `Created ${allDocuments.length} Word document(s):`
+      );
+
+      for (const file of allDocuments) {
+        console.log(` - ${file}`);
+      }
+    }
   } finally {
     await browser.close();
   }
 }
 
-main().catch((err) => {
-  console.error("AGENT FAILED:", err);
+main().catch(error => {
+  console.error("AGENT FAILED:", error);
   process.exit(1);
 });
