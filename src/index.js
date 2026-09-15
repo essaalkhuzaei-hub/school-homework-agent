@@ -193,68 +193,83 @@ async function openHomeworkPage(page) {
 async function selectStudent(page, studentName) {
   console.log(`Selecting student: ${studentName}`);
 
-  /*
-    The portal shows the currently selected student in the
-    upper-left area. Clicking the student/avatar opens My Ward(s).
-  */
+  // 1. Find the currently selected ward in the left sidebar
+  const currentWard = page
+    .locator("aside")
+    .getByText(/MARYAM|MUNEERA/i)
+    .first();
 
-  const currentWardCandidates = [
-    page.locator("aside").getByText(/MARYAM|MUNEERA/i).first(),
-    page.getByText(/MARYAM|MUNEERA/i).first()
-  ];
+  if (!(await currentWard.count())) {
+    throw new Error("Could not find current student selector.");
+  }
 
-  let currentWard = null;
+  console.log("Opening My Ward(s) selector...");
 
-  for (const candidate of currentWardCandidates) {
-    if (await candidate.count() && await isVisible(candidate)) {
-      currentWard = candidate;
+  // Open My Ward(s)
+  await currentWard.click({ force: true });
+  await page.waitForTimeout(1000);
+
+  // 2. Find the requested student inside the opened ward selector
+  const studentNameRegex = new RegExp(`^${studentName}$`, "i");
+
+  const candidates = page.getByText(studentNameRegex, {
+    exact: true
+  });
+
+  let target = null;
+
+  for (let i = 0; i < await candidates.count(); i++) {
+    const candidate = candidates.nth(i);
+
+    if (await candidate.isVisible().catch(() => false)) {
+      target = candidate;
       break;
     }
   }
 
-  if (!currentWard) {
+  if (!target) {
     throw new Error(
-      `Could not find the current student selector before selecting ${studentName}.`
+      `Visible student ${studentName} was not found in My Ward(s).`
     );
   }
 
-  await currentWard.click();
-  await page.waitForTimeout(1200);
+  console.log(`Found visible student card: ${studentName}`);
 
-  const target = page
-    .getByText(new RegExp(`^${studentName}$`, "i"), { exact: true })
-    .last();
+  // 3. Click the visible student/card
+  await target.evaluate((element) => {
+    const clickable =
+      element.closest("a") ||
+      element.closest("button") ||
+      element.closest("[onclick]") ||
+      element.parentElement;
 
-  if (!(await target.count())) {
-    throw new Error(
-      `Student ${studentName} was not found in My Ward(s).`
-    );
-  }
+    clickable.click();
+  });
 
-  await target.click();
+  console.log(`Clicked student: ${studentName}`);
 
+  // 4. Give the portal time to switch student
   await page.waitForTimeout(3000);
-  await page
-    .waitForLoadState("domcontentloaded")
-    .catch(() => {});
 
-  console.log(`${studentName} selected.`);
-
-  /*
-    Some versions of the portal return to the dashboard after
-    changing student, so reopen HomeWork Submission if necessary.
-  */
-
+  // Some versions return to dashboard after switching students.
+  // Re-open Homework Submission when necessary.
   const homeworkHeading = page
     .getByText("Homeworks", { exact: true })
     .first();
 
-  if (!(await isVisible(homeworkHeading))) {
+  if (!(await homeworkHeading.isVisible().catch(() => false))) {
+    console.log(
+      `Homework page not visible after selecting ${studentName}. Reopening it...`
+    );
+
     await openHomeworkPage(page);
   }
 
   await page.waitForTimeout(2000);
+
+  console.log(`${studentName} selected successfully.`);
 }
+
 
 /* =========================================================
    FIND HOMEWORK ROWS
